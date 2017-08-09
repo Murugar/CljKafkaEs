@@ -1,0 +1,66 @@
+(ns CljKStreamES.core
+  (:use [clojure.tools.logging :only (info debug error warn)])
+  (:require [clojure.data.json :as json]
+            [clojure.tools.cli :as cli]
+            [clojure.core.async :refer [<!! >!! <! >! close! chan go-loop]]
+            [CljKStreamES.cli :as cli-def]
+            [CljKStreamES.from-kafka :as from-kafka]
+            [CljKStreamES.to-elasticsearch :as to-es]
+            [franzy.admin.zookeeper.client :as client]
+            [franzy.admin.topics :refer :all])
+  (:gen-class))
+
+;; State
+(def state (atom {}))
+
+(defn- start-strange-loop []
+  (info "Started strange loop")
+  (while true
+    (and
+      (<!! (:consumer_sentinal @state))
+      (<!! (:es_sentinal @state)))))
+
+(defn- stop-strange-loop []
+  (info "Stopping Strange Loop")
+  (Thread. #(do
+              (close! (:consumer_sentinal @state))
+              (close! (:es_sentinal @state)))))
+
+(defn- listen-for-shutdown []
+  (.addShutdownHook
+    (Runtime/getRuntime)
+    (stop-strange-loop)))
+
+
+(defn bootstrap []
+  (swap! state assoc
+         :from_kafa (chan)
+         :consumer (from-kafka/create-consumer @state)
+         :es_connection (to-es/create-es-connection (:elasticsearch @state)))
+  (with-open [zk-utils (client/make-zk-utils {:servers (:zookeeper @state)} false)]
+    (when-not (topic-exists? zk-utils (:topic @state))
+      (create-topic! zk-utils (:topic @state) 1)))
+  (swap! state assoc :consumer_sentinal (from-kafka/start-consuming @state))
+  (swap! state assoc :es_sentinal (to-es/start-indexing @state)))
+
+
+
+(defn -main [& args]
+  (let [{:keys [options arguments errors summary]} (cli/parse-opts args cli-def/cli-options)]
+    (cond
+      (:help options) (cli-def/exit 0 (cli-def/usage summary))
+      (not= (count (keys options)) 6) (cli-def/exit 1 (cli-def/usage summary))
+      errors (cli-def/exit 1 (cli-def/error-msg errors)))
+    (swap! state assoc
+           :es_type (:index-type options)
+           :es_index (:index options)
+           :elasticsearch (:elasticsearch options)
+           :broker (:broker options)
+           :zookeeper (:zookeeper options)
+           :topic (:topic options)
+           :consumer-group-id "CljKStreamES"
+           :consumer_sentinal (chan)
+           :es_sentinal (chan))
+    (bootstrap)
+    (listen-for-shutdown)
+    (start-strange-loop)))
